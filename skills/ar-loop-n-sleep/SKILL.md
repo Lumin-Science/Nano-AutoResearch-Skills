@@ -19,7 +19,10 @@ Keep exactly two persistent control files in the project:
 ## On every invocation
 
 Read `PROMPT.md` and the last five rows of `events.tsv`, then inspect the real
-project and run state.
+project and run state. If the current user message begins with
+`@@AR-CONTINUE@@`, treat it as a scheduled continuation marker: resume from
+`PROMPT.md` and `events.tsv`, and do not overwrite `PROMPT.md` or treat the
+message as a new kickoff task.
 
 - **First invocation:** create the two files, record the original task, and
   follow it until training is underway and healthy.
@@ -59,7 +62,7 @@ set -euo pipefail
 
 delay_seconds="$1"
 pane="$2"
-message='Use $ar-loop-n-sleep and continue.'
+message='@@AR-CONTINUE@@ Use $ar-loop-n-sleep and continue.'
 
 sleep "$delay_seconds"
 
