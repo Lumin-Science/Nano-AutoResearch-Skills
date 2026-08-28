@@ -1,0 +1,4 @@
+interface:
+  display_name: "AR Meeting"
+  short_description: "Review a local deck with click-to-ask threads"
+  default_prompt: "Use $ar-meeting to open my generated deck for a local interactive review."

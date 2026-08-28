@@ -1,0 +1,4 @@
+interface:
+  display_name: "AR Loop & Sleep"
+  short_description: "Advance long AR runs without token polling"
+  default_prompt: "Use $ar-loop-n-sleep to continue this long-running research task in tmux and wake the same pane at the next useful check."

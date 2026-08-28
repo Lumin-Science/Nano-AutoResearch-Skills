@@ -1,0 +1,653 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title><!--LM:TITLE--></title>
+<link rel="stylesheet" href="theme.css">
+<!--LM:HEAD-->
+<script id="lm-config" type="application/json"><!--LM:CONFIG--></script>
+</head>
+<body>
+<div id="lm-root">
+  <aside id="lm-thumbs"></aside>
+  <main id="lm-stage">
+    <header id="lm-topbar">
+      <span id="lm-title"><!--LM:TITLE--></span>
+      <span id="lm-counter"></span>
+      <button class="lm-btn" id="lm-prev" title="previous slide (←)">←</button>
+      <button class="lm-btn" id="lm-next" title="next slide (→)">→</button>
+      <button class="lm-btn" id="lm-margin-toggle" title="show/hide comments">comments</button>
+    </header>
+    <div id="lm-slides">
+<!--LM:SLIDES-->
+    </div>
+  </main>
+  <div id="lm-margin-resizer" role="separator" aria-label="Resize comment panel"
+       aria-orientation="vertical" tabindex="0"></div>
+  <aside id="lm-margin">
+    <div id="lm-margin-head">
+      <strong>Comments</strong>
+      <span class="lm-status" id="lm-answerer">…</span>
+      <button class="lm-btn" id="lm-export" title="export all slide feedback">Export</button>
+      <button class="lm-btn lm-btn-danger" id="lm-end" title="end the meeting">End</button>
+    </div>
+    <div id="lm-cards"></div>
+  </aside>
+</div>
+
+<!-- comment composer, moved to the click point -->
+<div id="lm-composer" hidden>
+  <div id="lm-composer-quote" hidden></div>
+  <textarea id="lm-composer-text" rows="3"
+    placeholder="Comment on this spot… (Enter to send, Esc to cancel)"></textarea>
+  <div class="lm-model-controls" id="lm-composer-models">
+    <label>Model<select id="lm-composer-model"></select></label>
+    <label>Effort<select id="lm-composer-effort"></select></label>
+  </div>
+  <div id="lm-composer-actions">
+    <span class="lm-hint" id="lm-composer-where"></span>
+    <button class="lm-btn" id="lm-composer-cancel" type="button">Cancel</button>
+    <button class="lm-btn lm-btn-primary" id="lm-composer-send" type="button">Comment</button>
+  </div>
+</div>
+
+<script>
+(function () {
+"use strict";
+
+var CFG = {};
+try { CFG = JSON.parse(document.getElementById("lm-config").textContent); } catch (e) { CFG = {}; }
+if (CFG.margin_position === "left") document.body.setAttribute("data-chat", "left");
+
+function $(id) { return document.getElementById(id); }
+var slidesEl = $("lm-slides"), cardsEl = $("lm-cards"), thumbs = $("lm-thumbs"),
+    composer = $("lm-composer"), composerText = $("lm-composer-text"),
+    answererEl = $("lm-answerer");
+var slides = [].slice.call(document.querySelectorAll("#lm-slides > section[data-slide]"));
+var cur = 0, threads = [], latest = 0, ended = false, active = null, misses = 0, everOnline = false;
+var answererReady = true;   /* false => nothing is auto-answering; an agent must poll */
+var draft = {};                 /* per-thread follow-up text, preserved across re-renders */
+var choices = {};               /* per-thread model/effort choice while drafting */
+var pending = null;             /* {slide,x,y,quote} while the composer is open */
+var models = [], defaultChoice = { model: null, effort: null };
+
+/* ---------- navigation ---------- */
+function show(i) {
+  if (!slides.length) return;
+  i = Math.max(0, Math.min(slides.length - 1, i));
+  cur = i;
+  slides.forEach(function (s, j) { s.classList.toggle("active", j === i); });
+  [].forEach.call(thumbs.children, function (t, j) { t.classList.toggle("active", j === i); });
+  $("lm-counter").textContent = (i + 1) + " / " + slides.length;
+  if (history.replaceState) history.replaceState(null, "", "#s" + (i + 1));
+  closeComposer();
+  render();
+}
+function fromHash() {
+  var m = location.hash.match(/^#s(\d+)/);
+  show(m ? parseInt(m[1], 10) - 1 : 0);
+}
+window.addEventListener("hashchange", fromHash);
+$("lm-prev").addEventListener("click", function () { show(cur - 1); });
+$("lm-next").addEventListener("click", function () { show(cur + 1); });
+document.addEventListener("keydown", function (e) {
+  if (e.key === "Escape") { closeComposer(); return; }
+  var t = e.target.tagName;
+  if (t === "TEXTAREA" || t === "INPUT") return;
+  if (e.key === "ArrowRight" || e.key === "PageDown") { e.preventDefault(); show(cur + 1); }
+  if (e.key === "ArrowLeft" || e.key === "PageUp") { e.preventDefault(); show(cur - 1); }
+});
+
+slides.forEach(function (s, i) {
+  var d = document.createElement("div");
+  d.className = "lm-thumb";
+  d.tabIndex = 0;
+  var img = s.querySelector("img");
+  if (img) {
+    var ti = document.createElement("div");
+    ti.className = "lm-thumb-img";
+    ti.style.backgroundImage = 'url("' + img.getAttribute("src") + '")';
+    d.appendChild(ti);
+  }
+  var lab = document.createElement("div");
+  lab.className = "lm-thumb-label";
+  lab.textContent = (i + 1) + " · " + (s.getAttribute("data-topic") || "");
+  d.appendChild(lab);
+  var badge = document.createElement("span");
+  badge.className = "lm-thumb-badge";
+  badge.hidden = true;
+  d.appendChild(badge);
+  d.addEventListener("click", function () { show(i); });
+  d.addEventListener("keydown", function (e) { if (e.key === "Enter") show(i); });
+  thumbs.appendChild(d);
+});
+
+/* ---------- local UI preferences ---------- */
+var prefKey = "labmeet." + (CFG.meeting || location.pathname);
+function readPref(name, fallback) {
+  try { return localStorage.getItem(prefKey + "." + name) || fallback; }
+  catch (e) { return fallback; }
+}
+function writePref(name, value) {
+  try { localStorage.setItem(prefKey + "." + name, value); } catch (e) {}
+}
+function clampMargin(value) {
+  return Math.max(280, Math.min(Math.min(760, window.innerWidth * 0.68), value));
+}
+var savedWidth = parseInt(readPref("marginWidth", "0"), 10);
+if (savedWidth) document.documentElement.style.setProperty("--lm-margin-width",
+                                                            clampMargin(savedWidth) + "px");
+var resizer = $("lm-margin-resizer"), dragStart = null;
+resizer.addEventListener("pointerdown", function (e) {
+  dragStart = { x: e.clientX, width: $("lm-margin").getBoundingClientRect().width };
+  resizer.setPointerCapture(e.pointerId);
+  document.body.classList.add("lm-resizing");
+});
+resizer.addEventListener("pointermove", function (e) {
+  if (!dragStart) return;
+  var sign = CFG.margin_position === "left" ? 1 : -1;
+  var width = clampMargin(dragStart.width + sign * (e.clientX - dragStart.x));
+  document.documentElement.style.setProperty("--lm-margin-width", width + "px");
+  writePref("marginWidth", String(Math.round(width)));
+});
+function stopResize() { dragStart = null; document.body.classList.remove("lm-resizing"); }
+resizer.addEventListener("pointerup", stopResize);
+resizer.addEventListener("pointercancel", stopResize);
+resizer.addEventListener("keydown", function (e) {
+  if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") return;
+  e.preventDefault();
+  var current = $("lm-margin").getBoundingClientRect().width;
+  var outward = (CFG.margin_position === "left" ? e.key === "ArrowRight" : e.key === "ArrowLeft");
+  var width = clampMargin(current + (outward ? 24 : -24));
+  document.documentElement.style.setProperty("--lm-margin-width", width + "px");
+  writePref("marginWidth", String(Math.round(width)));
+});
+
+/* ---------- Codex model + effort picker ---------- */
+function modelEntry(id) {
+  for (var i = 0; i < models.length; i++) if (models[i].id === id) return models[i];
+  return null;
+}
+function inferredDefaultChoice() {
+  var savedModel = readPref("model", ""), entry = modelEntry(savedModel);
+  if (!entry) {
+    for (var i = 0; i < models.length; i++) if (models[i].isDefault) { entry = models[i]; break; }
+  }
+  entry = entry || models[0] || null;
+  if (!entry) return { model: null, effort: null };
+  var savedEffort = readPref("effort", "");
+  var allowed = entry.supportedReasoningEfforts || [];
+  var effort = allowed.indexOf(savedEffort) >= 0 ? savedEffort
+    : (entry.defaultReasoningEffort || allowed[0] || null);
+  return { model: entry.id, effort: effort };
+}
+function picker(modelSelect, effortSelect, choice, changed) {
+  modelSelect.innerHTML = "";
+  if (!models.length) {
+    var unavailable = document.createElement("option");
+    unavailable.textContent = "Codex default"; unavailable.value = "";
+    modelSelect.appendChild(unavailable);
+    effortSelect.innerHTML = '<option value="">default</option>';
+    modelSelect.disabled = effortSelect.disabled = true;
+    return;
+  }
+  modelSelect.disabled = effortSelect.disabled = false;
+  models.forEach(function (row) {
+    var option = document.createElement("option");
+    option.value = row.id; option.textContent = row.displayName || row.id;
+    modelSelect.appendChild(option);
+  });
+  var selected = modelEntry(choice && choice.model) || modelEntry(defaultChoice.model) || models[0];
+  modelSelect.value = selected.id;
+  function fillEffort(wanted) {
+    effortSelect.innerHTML = "";
+    var entry = modelEntry(modelSelect.value), allowed = entry.supportedReasoningEfforts || [];
+    if (!allowed.length) {
+      var option = document.createElement("option"); option.value = ""; option.textContent = "default";
+      effortSelect.appendChild(option); effortSelect.disabled = true; return;
+    }
+    effortSelect.disabled = false;
+    allowed.forEach(function (value) {
+      var option = document.createElement("option"); option.value = value; option.textContent = value;
+      effortSelect.appendChild(option);
+    });
+    effortSelect.value = allowed.indexOf(wanted) >= 0 ? wanted
+      : (entry.defaultReasoningEffort || allowed[0]);
+  }
+  fillEffort(choice && choice.effort);
+  modelSelect.onchange = function () {
+    fillEffort(null);
+    if (changed) changed({ model: modelSelect.value, effort: effortSelect.value || null });
+  };
+  effortSelect.onchange = function () {
+    if (changed) changed({ model: modelSelect.value, effort: effortSelect.value || null });
+  };
+}
+function selectedChoice(modelSelect, effortSelect) {
+  return { model: modelSelect.value || null, effort: effortSelect.value || null };
+}
+function rememberChoice(choice) {
+  if (!choice || !choice.model) return;
+  defaultChoice = choice;
+  writePref("model", choice.model); writePref("effort", choice.effort || "");
+}
+function loadModels() {
+  fetch("/api/models").then(function (r) { return r.json(); }).then(function (j) {
+    models = j.models || []; defaultChoice = inferredDefaultChoice();
+    picker($("lm-composer-model"), $("lm-composer-effort"), defaultChoice, rememberChoice);
+    render();
+  }).catch(function () {
+    picker($("lm-composer-model"), $("lm-composer-effort"), defaultChoice);
+  });
+}
+
+/* the element a pin is positioned against: the page image, canvas, or the section */
+function surfaceOf(section) {
+  return section.querySelector(".lm-page, .lm-canvas") || section;
+}
+
+/* ---------- composer ---------- */
+function openComposer(slide, x, y, quote, clientX, clientY) {
+  if (ended) return;
+  pending = { slide: slide, x: x, y: y, quote: quote || null };
+  $("lm-composer-where").textContent = "slide " + slide;
+  var q = $("lm-composer-quote");
+  if (quote) { q.textContent = "“" + quote.slice(0, 160) + "”"; q.hidden = false; }
+  else { q.hidden = true; }
+  composer.hidden = false;
+  var w = composer.offsetWidth, h = composer.offsetHeight;
+  var left = Math.min(Math.max(8, clientX + 12), window.innerWidth - w - 8);
+  var top = Math.min(Math.max(8, clientY + 12), window.innerHeight - h - 8);
+  composer.style.left = left + "px";
+  composer.style.top = top + "px";
+  composerText.value = "";
+  picker($("lm-composer-model"), $("lm-composer-effort"), defaultChoice, rememberChoice);
+  composerText.focus();
+  render();
+}
+function closeComposer() {
+  composer.hidden = true;
+  pending = null;
+  var g = document.querySelector(".lm-pin-ghost");
+  if (g) g.remove();
+}
+function sendComposer() {
+  if (!pending) return;
+  var text = composerText.value.trim();
+  if (!text) return;
+  var choice = selectedChoice($("lm-composer-model"), $("lm-composer-effort"));
+  rememberChoice(choice);
+  var body = { slide: pending.slide, x: pending.x, y: pending.y,
+               quote: pending.quote, text: text,
+               model: choice.model, effort: choice.effort };
+  composerText.disabled = true;
+  post("/api/threads", body, function (ok) {
+    composerText.disabled = false;
+    if (ok) { closeComposer(); pollThreads(true); }
+    else { note("Could not reach the meeting server."); }
+  });
+}
+$("lm-composer-send").addEventListener("click", sendComposer);
+$("lm-composer-cancel").addEventListener("click", closeComposer);
+composerText.addEventListener("keydown", function (e) {
+  if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendComposer(); }
+});
+
+slidesEl.addEventListener("click", function (e) {
+  if (ended) return;
+  if (e.target.closest(".lm-pin")) return;          /* pin clicks focus a thread */
+  if (e.target.closest("a, summary, .lm-notes")) return;
+  /* derive the slide from what was actually clicked, not from `cur` — they can
+     disagree while a hashchange is still in flight */
+  var section = e.target.closest("section[data-slide]") || slides[cur];
+  if (!section) return;
+  var surface = surfaceOf(section);
+  var r = surface.getBoundingClientRect();
+  if (e.clientX < r.left || e.clientX > r.right || e.clientY < r.top || e.clientY > r.bottom) return;
+  var x = (e.clientX - r.left) / r.width * 100;
+  var y = (e.clientY - r.top) / r.height * 100;
+  var sel = window.getSelection();
+  var quote = sel && !sel.isCollapsed ? sel.toString().replace(/\s+/g, " ").trim() : "";
+  openComposer(parseInt(section.getAttribute("data-slide"), 10), x, y,
+               quote.length >= 4 ? quote.slice(0, 400) : null, e.clientX, e.clientY);
+});
+
+/* ---------- rendering ---------- */
+function threadsForSlide(n) {
+  return threads.filter(function (t) { return t.slide === n; })
+                .sort(function (a, b) { return a.y - b.y; });
+}
+function pinNumber(t) {
+  var list = threadsForSlide(t.slide);
+  for (var i = 0; i < list.length; i++) if (list[i].id === t.id) return i + 1;
+  return "?";
+}
+function waiting(t) {
+  var last = t.messages[t.messages.length - 1];
+  return last && (last.role === "user" || last.status === "pending");
+}
+
+function renderPins() {
+  [].forEach.call(document.querySelectorAll(".lm-pin"), function (p) { p.remove(); });
+  var section = slides[cur];
+  if (!section) return;
+  var surface = surfaceOf(section);
+  if (getComputedStyle(surface).position === "static") surface.style.position = "relative";
+  threadsForSlide(cur + 1).forEach(function (t) {
+    var pin = document.createElement("button");
+    pin.type = "button";
+    pin.className = "lm-pin" + (t.resolved ? " lm-pin-resolved" : "") +
+                    (active === t.id ? " lm-pin-active" : "") +
+                    (waiting(t) ? " lm-pin-waiting" : "");
+    pin.style.left = t.x + "%";
+    pin.style.top = t.y + "%";
+    pin.textContent = pinNumber(t);
+    pin.title = (t.messages[0] && t.messages[0].text || "").slice(0, 80);
+    pin.addEventListener("click", function (ev) {
+      ev.stopPropagation();
+      active = t.id;
+      render();
+      var card = document.getElementById("card-" + t.id);
+      if (card) card.scrollIntoView({ block: "nearest" });
+    });
+    surface.appendChild(pin);
+  });
+  if (pending) {
+    var ghost = document.createElement("div");
+    ghost.className = "lm-pin lm-pin-ghost";
+    ghost.style.left = pending.x + "%";
+    ghost.style.top = pending.y + "%";
+    ghost.textContent = "+";
+    surface.appendChild(ghost);
+  }
+}
+
+function renderCards() {
+  var list = threadsForSlide(cur + 1);
+  cardsEl.innerHTML = "";
+  if (!list.length) {
+    var empty = document.createElement("div");
+    empty.className = "lm-empty";
+    empty.textContent = ended
+      ? "Meeting ended."
+      : "Click anywhere on the slide to leave a comment. Answers appear here.";
+    cardsEl.appendChild(empty);
+    return;
+  }
+  if (!list.some(function (t) { return t.id === active; })) active = list[0].id;
+
+  var tabs = document.createElement("div");
+  tabs.className = "lm-thread-tabs";
+  tabs.setAttribute("role", "tablist");
+  list.forEach(function (t) {
+    var tab = document.createElement("button");
+    tab.type = "button"; tab.className = "lm-thread-tab" +
+      (t.id === active ? " active" : "") + (waiting(t) ? " waiting" : "");
+    tab.setAttribute("role", "tab"); tab.setAttribute("aria-selected", t.id === active ? "true" : "false");
+    tab.title = (t.messages[0] && t.messages[0].text || "").slice(0, 160);
+    tab.textContent = pinNumber(t) + " · " +
+      (t.messages[0] && t.messages[0].text || "comment").replace(/\s+/g, " ").slice(0, 30);
+    tab.addEventListener("click", function () { active = t.id; render(); });
+    tabs.appendChild(tab);
+  });
+  cardsEl.appendChild(tabs);
+
+  var t = list.filter(function (row) { return row.id === active; })[0] || list[0];
+  var card = document.createElement("div");
+  card.className = "lm-card lm-card-active" + (t.resolved ? " lm-card-resolved" : "");
+  card.id = "card-" + t.id;
+  var head = document.createElement("div"); head.className = "lm-card-head";
+  var num = document.createElement("span"); num.className = "lm-card-num"; num.textContent = pinNumber(t);
+  head.appendChild(num);
+  var meta = document.createElement("span"); meta.className = "lm-card-meta";
+  meta.textContent = t.resolved ? "resolved"
+    : (waiting(t) ? (answererReady ? "answering…" : "waiting for an agent") : "answered");
+  head.appendChild(meta);
+  var res = document.createElement("button"); res.type = "button"; res.className = "lm-card-resolve";
+  res.textContent = t.resolved ? "reopen" : "resolve";
+  res.addEventListener("click", function () {
+    post("/api/threads/" + t.id + "/" + (t.resolved ? "unresolve" : "resolve"), {},
+         function () { pollThreads(true); });
+  });
+  head.appendChild(res); card.appendChild(head);
+
+  if (t.quote) {
+    var q = document.createElement("div"); q.className = "lm-card-quote";
+    q.textContent = "“" + t.quote + "”"; card.appendChild(q);
+  }
+
+  var transcript = document.createElement("div"); transcript.className = "lm-transcript";
+  t.messages.forEach(function (m) {
+    var wrap = document.createElement("div"); wrap.className = "lm-msg-wrap lm-msg-wrap-" + m.role;
+    var label = document.createElement("div"); label.className = "lm-msg-label";
+    label.textContent = m.role === "user" ? "You" :
+      ("Codex" + (m.model ? " · " + m.model : "") + (m.effort ? " · " + m.effort : ""));
+    wrap.appendChild(label);
+    var el = document.createElement("div"); el.className = "lm-msg lm-msg-" + m.role;
+    if (m.role === "agent") {
+      if (m.status === "pending") {
+        el.className += " lm-msg-pending";
+        el.innerHTML = '<span class="lm-dots"><i></i><i></i><i></i></span>';
+      } else {
+        if (m.status === "failed") el.className += " lm-msg-failed";
+        el.innerHTML = md(m.text || "");
+      }
+    } else { el.textContent = m.text; }
+    wrap.appendChild(el); transcript.appendChild(wrap);
+  });
+  card.appendChild(transcript);
+
+  if (!t.resolved && !ended) {
+    var form = document.createElement("div"); form.className = "lm-followup";
+    var input = document.createElement("textarea"); input.rows = 2; input.placeholder = "Follow up…";
+    input.value = draft[t.id] || "";
+    input.addEventListener("input", function () { draft[t.id] = input.value; });
+    var controls = document.createElement("div"); controls.className = "lm-followup-controls";
+    var modelLabel = document.createElement("label"); modelLabel.textContent = "Model";
+    var modelSelect = document.createElement("select"); modelLabel.appendChild(modelSelect);
+    var effortLabel = document.createElement("label"); effortLabel.textContent = "Effort";
+    var effortSelect = document.createElement("select"); effortLabel.appendChild(effortSelect);
+    var lastUser = null;
+    for (var i = t.messages.length - 1; i >= 0; i--) if (t.messages[i].role === "user") {
+      lastUser = t.messages[i]; break;
+    }
+    var initial = choices[t.id] || (lastUser && lastUser.model ?
+      { model: lastUser.model, effort: lastUser.effort } : defaultChoice);
+    picker(modelSelect, effortSelect, initial, function (choice) { choices[t.id] = choice; rememberChoice(choice); });
+    var send = document.createElement("button"); send.type = "button";
+    send.className = "lm-btn lm-btn-primary"; send.textContent = "Send";
+    function sendFollowup() {
+      var text = input.value.trim(); if (!text) return;
+      var choice = selectedChoice(modelSelect, effortSelect); choices[t.id] = choice; rememberChoice(choice);
+      input.disabled = send.disabled = true;
+      post("/api/threads/" + t.id + "/messages",
+           { text: text, model: choice.model, effort: choice.effort }, function (ok) {
+        input.disabled = send.disabled = false;
+        if (ok) { draft[t.id] = ""; input.value = ""; pollThreads(true); }
+      });
+    }
+    input.addEventListener("keydown", function (e) {
+      if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendFollowup(); }
+    });
+    send.addEventListener("click", sendFollowup);
+    controls.appendChild(modelLabel); controls.appendChild(effortLabel); controls.appendChild(send);
+    form.appendChild(input); form.appendChild(controls); card.appendChild(form);
+  }
+  cardsEl.appendChild(card);
+}
+
+function renderBadges() {
+  [].forEach.call(thumbs.children, function (thumb, i) {
+    var n = threadsForSlide(i + 1).length;
+    var badge = thumb.querySelector(".lm-thumb-badge");
+    if (!badge) return;
+    badge.hidden = n === 0;
+    badge.textContent = n;
+  });
+}
+
+var renderQueued = false;
+function render() {
+  if (renderQueued) return;
+  renderQueued = true;
+  requestAnimationFrame(function () {
+    renderQueued = false;
+    renderPins();
+    renderCards();
+    renderBadges();
+  });
+}
+
+/* ---------- transport ---------- */
+function post(path, body, done) {
+  fetch(path, { method: "POST", headers: { "Content-Type": "application/json" },
+                body: JSON.stringify(body) })
+    .then(function (r) { if (done) done(r.ok); })
+    .catch(function () { if (done) done(false); });
+}
+function note(t) {
+  var d = document.createElement("div");
+  d.className = "lm-empty";
+  d.textContent = t;
+  cardsEl.insertBefore(d, cardsEl.firstChild);
+}
+function pollThreads(force) {
+  fetch("/api/threads?since=" + (force ? 0 : latest))
+    .then(function (r) { return r.json(); })
+    .then(function (j) {
+      setOnline(true);
+      if (j.threads) { threads = j.threads; latest = j.latest; render(); }
+      else if (j.latest) { latest = j.latest; }
+    })
+    .catch(function () { setOnline(false); });
+}
+function setOnline(v) {
+  if (v) { misses = 0; everOnline = true; return; }
+  misses++;
+  if (ended || misses < 2) return;
+  answererEl.textContent = everOnline ? "server stopped" : "no server — read-only";
+  answererEl.className = "lm-status off";
+}
+function setEnded() {
+  if (ended) return;
+  ended = true;
+  document.body.classList.add("lm-ended");
+  closeComposer();
+  answererEl.textContent = "meeting ended";
+  answererEl.className = "lm-status off";
+  render();
+}
+function pollStatus() {
+  fetch("/api/status").then(function (r) { return r.json(); }).then(function (j) {
+    setOnline(true);
+    if (j.ended) { setEnded(); return; }
+    if (ended) return;
+    var readyNow = j.answer_mode === "auto" ? !!j.answerer_ready : !!j.agent_connected;
+    if (readyNow !== answererReady) { answererReady = readyNow; render(); }
+    if (j.answer_mode === "auto") {
+      answererEl.textContent = j.answerer_ready
+        ? (j.fork_state === "pending" && j.answerer === "forked Codex task"
+            ? "forks this task for each comment tab"
+            : "answers by " + j.answerer)
+        : "answerer unavailable — questions queue up";
+      answererEl.className = "lm-status " + (j.answerer_ready ? "on" : "off");
+    } else {
+      answererEl.textContent = j.agent_connected ? "agent connected"
+        : "agent not connected — comments queue up";
+      answererEl.className = "lm-status " + (j.agent_connected ? "on" : "off");
+    }
+  }).catch(function () { setOnline(false); });
+}
+$("lm-end").addEventListener("click", function () {
+  if (!confirm("End the meeting? Feedback will be exported and the server will stop.")) return;
+  post("/api/end", {}, function (ok) { if (ok) setEnded(); });
+});
+$("lm-export").addEventListener("click", function () {
+  var button = $("lm-export"); button.disabled = true; button.textContent = "Exporting…";
+  fetch("/api/export", { method: "POST", headers: { "Content-Type": "application/json" },
+                         body: "{}" })
+    .then(function (r) { return r.json().then(function (j) { return { ok: r.ok, data: j }; }); })
+    .then(function (result) {
+      button.disabled = false; button.textContent = "Export";
+      note(result.ok ? ("Exported " + result.data.threads + " thread(s) to\n" +
+           result.data.markdown + "\n" + result.data.json) : "Export failed.");
+    }).catch(function () { button.disabled = false; button.textContent = "Export"; note("Export failed."); });
+});
+$("lm-margin-toggle").addEventListener("click", function () {
+  document.body.classList.toggle("lm-margin-collapsed");
+});
+window.addEventListener("resize", render);
+
+/* ---------- tiny markdown renderer ---------- */
+function esc(s) {
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+          .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+}
+function inline(s) {
+  s = s.replace(/`([^`]+)`/g, "<code>$1</code>");
+  s = s.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
+  s = s.replace(/(^|[\s(])\*([^*\s][^*]*?)\*/g, "$1<em>$2</em>");
+  s = s.replace(/(^|[\s(])_([^_\s][^_]*?)_/g, "$1<em>$2</em>");
+  s = s.replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g, function (m, text, url) {
+    return '<a href="' + url.replace(/["'<>`]/g, encodeURIComponent) +
+           '" target="_blank" rel="noopener noreferrer">' + text + "</a>";
+  });
+  return s;
+}
+function md(src) {
+  var lines = esc(src).split(/\r?\n/), out = [], i = 0;
+  while (i < lines.length) {
+    var ln = lines[i];
+    if (/^```/.test(ln)) {
+      var buf = []; i++;
+      while (i < lines.length && !/^```/.test(lines[i])) { buf.push(lines[i]); i++; }
+      i++;
+      out.push("<pre><code>" + buf.join("\n") + "</code></pre>");
+      continue;
+    }
+    var h = ln.match(/^(#{1,4})\s+(.*)$/);
+    if (h) { out.push("<strong>" + inline(h[2]) + "</strong>"); i++; continue; }
+    if (/^\s*[-*+]\s+/.test(ln)) {
+      var ul = [];
+      while (i < lines.length && /^\s*[-*+]\s+/.test(lines[i])) {
+        ul.push("<li>" + inline(lines[i].replace(/^\s*[-*+]\s+/, "")) + "</li>"); i++;
+      }
+      out.push("<ul>" + ul.join("") + "</ul>"); continue;
+    }
+    if (/^\s*\d+[.)]\s+/.test(ln)) {
+      var ol = [];
+      while (i < lines.length && /^\s*\d+[.)]\s+/.test(lines[i])) {
+        ol.push("<li>" + inline(lines[i].replace(/^\s*\d+[.)]\s+/, "")) + "</li>"); i++;
+      }
+      out.push("<ol>" + ol.join("") + "</ol>"); continue;
+    }
+    if (/^\s*&gt;/.test(ln)) {
+      var q = [];
+      while (i < lines.length && /^\s*&gt;/.test(lines[i])) {
+        q.push(lines[i].replace(/^\s*&gt;\s?/, "")); i++;
+      }
+      out.push("<blockquote>" + inline(q.join(" ")) + "</blockquote>"); continue;
+    }
+    if (!ln.trim()) { i++; continue; }
+    var p = [];
+    while (i < lines.length && lines[i].trim() &&
+           !/^(```|#{1,4}\s|\s*[-*+]\s+|\s*\d+[.)]\s+|\s*&gt;)/.test(lines[i])) {
+      p.push(lines[i]); i++;
+    }
+    out.push("<p>" + inline(p.join(" ")) + "</p>");
+  }
+  return out.join("\n");
+}
+
+/* ---------- boot ---------- */
+fromHash();
+pollThreads(true);
+pollStatus();
+loadModels();
+setInterval(pollThreads, 2000);
+setInterval(pollStatus, 3000);
+})();
+</script>
+</body>
+</html>

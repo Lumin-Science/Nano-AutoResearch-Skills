@@ -1,0 +1,4 @@
+interface:
+  display_name: "AR Kickstart"
+  short_description: "Define the scientific question and evaluation"
+  default_prompt: "Use $ar-kickstart to establish the scientific-question and evaluation contracts, grill every perspective when I ask, then research the unresolved formulation evidence."

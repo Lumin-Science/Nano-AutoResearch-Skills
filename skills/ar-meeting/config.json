@@ -1,0 +1,29 @@
+{
+  "margin_position": "right",
+  "theme": "theme.css",
+  "poll_cycle_s": 25,
+  "idle_shutdown_min": 30,
+  "open_browser": true,
+  "render_dpi": 200,
+  "answer_mode": "fork",
+  "app_server_cmd": [
+    "codex",
+    "app-server",
+    "--listen",
+    "stdio://"
+  ],
+  "answer_cmd": [
+    "codex",
+    "exec",
+    "--sandbox",
+    "read-only",
+    "--skip-git-repo-check"
+  ],
+  "fallback_to_exec": true,
+  "answer_timeout_s": 240,
+  "answer_style": "quick",
+  "max_concurrent_answers": 1,
+  "model_catalog_limit": 100,
+  "export_basename": "slide-feedback",
+  "project_dir": ""
+}
