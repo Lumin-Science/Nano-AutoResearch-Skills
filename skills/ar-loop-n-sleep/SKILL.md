@@ -1,6 +1,6 @@
 ---
 name: ar-loop-n-sleep
-description: Continue iterative research in tmux while avoiding model-token use during long external runs. Read the original task and recent event log, advance the work until training is healthy, then schedule a delayed wake in the same pane.
+description: Continue iterative research in tmux while avoiding model-token use during long external runs. Read the original task and recent event log, advance until the run is healthy, then schedule a Codex queue wakeup at the next useful checkpoint.
 ---
 
 # AR Loop & Sleep
@@ -42,17 +42,55 @@ Before a normal exit:
 2. Append one event whose handoff is one or two sentences describing the
    current step.
 3. Estimate the next useful check time and convert it to a delay in seconds.
-4. Start one background sleeper that wakes this exact tmux pane:
+4. Resolve the current Codex session UUID, preferring an exported
+   `CODEX_SESSION_ID` or `CODEX_THREAD_ID` if one exists. If Codex does not
+   expose one, use the newest `session_id` in
+   `${CODEX_HOME:-$HOME/.codex}/history.jsonl`; fall back to the newest `id` in
+   `${CODEX_HOME:-$HOME/.codex}/session_index.jsonl`. If the session UUID cannot
+   be resolved, record the blockage and ask the user to provide the session ID;
+   do not schedule a blind terminal wake.
+5. Start one background sleeper that queues the continuation into that Codex
+   session:
 
 ```bash
 pane="${TMUX_PANE:?invoke ar-loop-n-sleep from inside tmux}"
 tmux display-message -p -t "$pane" '#{pane_id}' >/dev/null
+
+thread_id="${CODEX_SESSION_ID:-${CODEX_THREAD_ID:-}}"
+if [ -z "$thread_id" ]; then
+  thread_id="$(python3 - <<'PY'
+import json
+import os
+from pathlib import Path
+
+base = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex"))
+for filename, key in (("history.jsonl", "session_id"), ("session_index.jsonl", "id")):
+    path = base / filename
+    if not path.exists():
+        continue
+    for line in reversed(path.read_text().splitlines()):
+        try:
+            value = json.loads(line).get(key)
+        except json.JSONDecodeError:
+            continue
+        if value:
+            print(value)
+            raise SystemExit
+PY
+  )"
+fi
+
+test -n "$thread_id" || { echo "could not resolve Codex session UUID" >&2; exit 1; }
+codex_bin="$(command -v codex)" || { echo "codex CLI is required for queue wakeups" >&2; exit 1; }
+
 tmux run-shell -b \
   "sleep ${delay_seconds}; \
-   tmux send-keys -t '${pane}' -l -- 'Use \$ar-loop-n-sleep and continue.'; \
-   tmux send-keys -t '${pane}' Enter"
+   '${codex_bin}' queue --thread '${thread_id}' --message 'Use \$ar-loop-n-sleep and continue.'"
 ```
 
-Send the wake message and `Enter` separately. Do not spend model turns polling
-a healthy run. Do not claim success, fabricate healthy training, or schedule an
-unsafe continuation when work is genuinely blocked.
+Use `codex queue` for Codex wakeups. The older `tmux send-keys ... Enter`
+sequence can type into the TUI without submitting a new round, so use it only
+when queueing is unavailable and the user explicitly accepts a manual-submit
+wakeup. Do not spend model turns polling a healthy run. Do not claim success,
+fabricate healthy training, or schedule an unsafe continuation when work is
+genuinely blocked.
