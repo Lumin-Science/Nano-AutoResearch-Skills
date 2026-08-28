@@ -1,6 +1,6 @@
 ---
 name: ar-loop-n-sleep
-description: Continue iterative research in tmux while avoiding model-token use during long external runs. Read the original task and recent event log, advance until the run is healthy, then schedule a Codex queue wakeup at the next useful checkpoint.
+description: Continue iterative research in tmux while avoiding model-token use during long external runs. Read the original task and recent event log, advance until the run is healthy, then schedule a tmux-only wakeup at the next useful checkpoint.
 ---
 
 # AR Loop & Sleep
@@ -42,55 +42,47 @@ Before a normal exit:
 2. Append one event whose handoff is one or two sentences describing the
    current step.
 3. Estimate the next useful check time and convert it to a delay in seconds.
-4. Resolve the current Codex session UUID, preferring an exported
-   `CODEX_SESSION_ID` or `CODEX_THREAD_ID` if one exists. If Codex does not
-   expose one, use the newest `session_id` in
-   `${CODEX_HOME:-$HOME/.codex}/history.jsonl`; fall back to the newest `id` in
-   `${CODEX_HOME:-$HOME/.codex}/session_index.jsonl`. If the session UUID cannot
-   be resolved, record the blockage and ask the user to provide the session ID;
-   do not schedule a blind terminal wake.
-5. Start one background sleeper that queues the continuation into that Codex
-   session:
+4. Start one background sleeper that wakes this exact tmux pane using a
+   dependency-free tmux bridge: capture the pane before acting, type the wake
+   message literally, capture again to verify it landed, then send `Enter`
+   after a short delay.
 
 ```bash
 pane="${TMUX_PANE:?invoke ar-loop-n-sleep from inside tmux}"
+
 tmux display-message -p -t "$pane" '#{pane_id}' >/dev/null
 
-thread_id="${CODEX_SESSION_ID:-${CODEX_THREAD_ID:-}}"
-if [ -z "$thread_id" ]; then
-  thread_id="$(python3 - <<'PY'
-import json
-import os
-from pathlib import Path
+wake_script="$(mktemp "${TMPDIR:-/tmp}/ar-loop-n-sleep-wake.XXXXXX")"
+cat >"$wake_script" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
 
-base = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex"))
-for filename, key in (("history.jsonl", "session_id"), ("session_index.jsonl", "id")):
-    path = base / filename
-    if not path.exists():
-        continue
-    for line in reversed(path.read_text().splitlines()):
-        try:
-            value = json.loads(line).get(key)
-        except json.JSONDecodeError:
-            continue
-        if value:
-            print(value)
-            raise SystemExit
-PY
-  )"
+delay_seconds="$1"
+pane="$2"
+message='Use $ar-loop-n-sleep and continue.'
+
+sleep "$delay_seconds"
+
+tmux display-message -p -t "$pane" '#{pane_id}' >/dev/null
+tmux capture-pane -t "$pane" -p -J -S -20 >/dev/null
+
+tmux send-keys -t "$pane" -l -- "$message"
+sleep 0.2
+
+if ! tmux capture-pane -t "$pane" -p -J -S -20 | grep -F -- "$message" >/dev/null; then
+  echo "ar-loop-n-sleep: wake text was not visible in pane $pane; not pressing Enter" >&2
+  exit 1
 fi
 
-test -n "$thread_id" || { echo "could not resolve Codex session UUID" >&2; exit 1; }
-codex_bin="$(command -v codex)" || { echo "codex CLI is required for queue wakeups" >&2; exit 1; }
+tmux send-keys -t "$pane" Enter
+SH
 
-tmux run-shell -b \
-  "sleep ${delay_seconds}; \
-   '${codex_bin}' queue --thread '${thread_id}' --message 'Use \$ar-loop-n-sleep and continue.'"
+chmod +x "$wake_script"
+tmux run-shell -b "'$wake_script' '${delay_seconds}' '$pane'; rm -f '$wake_script'"
 ```
 
-Use `codex queue` for Codex wakeups. The older `tmux send-keys ... Enter`
-sequence can type into the TUI without submitting a new round, so use it only
-when queueing is unavailable and the user explicitly accepts a manual-submit
-wakeup. Do not spend model turns polling a healthy run. Do not claim success,
-fabricate healthy training, or schedule an unsafe continuation when work is
-genuinely blocked.
+This intentionally follows the tmux-bridge pattern from smux without depending
+on `tmux-bridge`: read the target pane, type literal text, read back to verify,
+then send keys. Do not use `codex queue` in this skill. Do not spend model turns
+polling a healthy run. Do not claim success, fabricate healthy training, or
+schedule an unsafe continuation when work is genuinely blocked.
