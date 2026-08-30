@@ -241,9 +241,11 @@ class Store:
         if op == "new":
             if tid in self.threads:
                 return
+            module = ev.get("module") if isinstance(ev.get("module"), dict) else None
             self.threads[tid] = {"id": tid, "slide": ev.get("slide", 1),
                                  "x": ev.get("x", 50), "y": ev.get("y", 50),
                                  "quote": ev.get("quote"), "created_at": ev.get("ts"),
+                                 "module": module,
                                  "resolved": False, "messages": []}
             self.order.append(tid)
         elif op == "msg":
@@ -276,13 +278,23 @@ class Store:
         return "%s%d" % (prefix, (max(used) + 1) if used else 1)
 
     # -- mutations ----------------------------------------------------
-    def new_thread(self, slide, x, y, text, quote=None, model=None, effort=None):
+    def new_thread(self, slide, x, y, text, quote=None, module=None,
+                   model=None, effort=None):
         with self.cond:
             seen = set(self.threads) | {e.get("id") for e in self._read_events()
                                         if e.get("op") == "new"}
             tid = self._next_id("t", seen)
             ev = {"op": "new", "id": tid, "slide": int(slide), "x": float(x),
                   "y": float(y), "quote": quote, "ts": self.ts()}
+            if isinstance(module, dict):
+                clean = {}
+                for key, limit in (("id", 100), ("kind", 40), ("label", 300),
+                                   ("text", 1000)):
+                    value = str(module.get(key, "")).strip()
+                    if value:
+                        clean[key] = value[:limit]
+                if clean:
+                    ev["module"] = clean
             self._append(ev)
             self._apply(ev)
             msg = self.add_message(tid, "user", text, notify=False,
@@ -411,9 +423,14 @@ def build_prompt(mdir, thread, cfg, project_root=None):
         except Exception:
             pass
     where = "slide %d at (%.0f%%, %.0f%%)" % (thread["slide"], thread["x"], thread["y"])
+    module = thread.get("module") or {}
+    if module.get("label"):
+        where += ', inside the block "%s"' % module["label"][:200]
     if thread.get("quote"):
         where += ', on the text "%s"' % thread["quote"][:200]
     parts.append("The supervisor placed a comment pin on %s." % where)
+    if module.get("text"):
+        parts += ["Selected block text:", module["text"].strip(), ""]
     if len(thread["messages"]) > 1:
         parts.append("")
         parts.append("This comment thread so far:")
@@ -510,6 +527,11 @@ def feedback_markdown(payload):
                           str(thread["quote"]).replace("\n", "\n> "), ""]
             else:
                 lines.append("")
+            if thread.get("module"):
+                module = thread["module"]
+                lines += ["- Block: `%s` (`%s`, `%s`)" %
+                          (module.get("label", ""), module.get("kind", ""),
+                           module.get("id", "")), ""]
             for message in thread.get("messages", []):
                 who = "User" if message.get("role") == "user" else "Codex"
                 details = []
@@ -1177,7 +1199,9 @@ class Handler(BaseHTTPRequestHandler):
         outline, text = slide_context(st.dir, thread["slide"])
         payload = {"type": "comment", "meeting": st.meeting_name(), "thread": thread["id"],
                    "mid": last["mid"], "slide": thread["slide"],
-                   "anchor": {"x": thread["x"], "y": thread["y"], "quote": thread.get("quote")},
+                   "anchor": {"x": thread["x"], "y": thread["y"],
+                              "quote": thread.get("quote"),
+                              "module": thread.get("module")},
                        "question": last["text"], "sent_at": now_iso(),
                        "model": last.get("model"), "effort": last.get("effort"),
                        "slide_text": text,
@@ -1238,6 +1262,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(400, {"ok": False, "error": "bad anchor"})
                 return
             quote = body.get("quote") or None
+            module = body.get("module") if isinstance(body.get("module"), dict) else None
             model, effort, error = self._selection(body)
             if error:
                 self._json(400, {"ok": False, "error": error})
@@ -1245,7 +1270,7 @@ class Handler(BaseHTTPRequestHandler):
             thread, _ = st.new_thread(slide, max(0.0, min(100.0, x)),
                                       max(0.0, min(100.0, y)), text[:4000],
                                       str(quote)[:500] if quote else None,
-                                      model=model, effort=effort)
+                                      module=module, model=model, effort=effort)
             srv.answerer.kick(thread["id"])
             self._json(200, {"ok": True, "thread": thread["id"]})
             return
@@ -1500,7 +1525,8 @@ def cmd_poll(mdir):
             payload = {"type": "comment", "meeting": st.meeting_name(),
                        "thread": thread["id"], "mid": last["mid"], "slide": thread["slide"],
                        "anchor": {"x": thread["x"], "y": thread["y"],
-                                  "quote": thread.get("quote")},
+                                  "quote": thread.get("quote"),
+                                  "module": thread.get("module")},
                        "question": last["text"], "sent_at": now_iso(), "slide_text": text,
                        "model": last.get("model"), "effort": last.get("effort"),
                        "history": [{"role": m["role"], "text": m["text"]}

@@ -212,7 +212,7 @@ body[data-chat="left"] #lm-root { flex-direction: row-reverse; }
 .lm-line { pointer-events: none; }
 
 /* rendered page (pdf/pptx image mode) */
-.lm-page { position: relative; }
+.lm-page { position: relative; container-type: inline-size; }
 .lm-page-img {
   width: 100%;
   display: block;
@@ -237,6 +237,33 @@ body[data-chat="left"] #lm-root { flex-direction: row-reverse; }
 .lm-textlayer::selection { background: var(--lm-accent-soft); }
 /* transparent positioned shape overlays (pptx) */
 .lm-overlay { position: absolute; z-index: 3; background: transparent; }
+/* PDF modules: block geometry comes from Poppler; word boxes preserve selection. */
+.lm-pdf-block {
+  min-width: 3px;
+  min-height: 3px;
+  overflow: visible;
+}
+.lm-pdf-block-text {
+  position: absolute;
+  inset: 0;
+  display: block;
+  color: transparent;
+  user-select: text;
+  -webkit-user-select: text;
+}
+.lm-pdf-word {
+  position: absolute;
+  display: block;
+  color: transparent;
+  white-space: nowrap;
+  line-height: 1;
+  overflow: visible;
+  cursor: text;
+  user-select: text;
+  -webkit-user-select: text;
+}
+.lm-pdf-word::selection { background: var(--lm-accent-soft); }
+.lm-pdf-block:focus-visible { outline: 2px solid var(--lm-accent); outline-offset: 2px; }
 
 /* speaker notes */
 .lm-notes {
@@ -425,6 +452,14 @@ body.lm-margin-collapsed #lm-margin, body.lm-margin-collapsed #lm-margin-resizer
   text-align: center;
 }
 .lm-card-meta { font-size: 11px; color: var(--lm-muted); flex: 1; }
+.lm-card-module {
+  margin: 0 0 7px;
+  color: var(--lm-accent);
+  font: 11px/1.35 var(--lm-mono);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .lm-card-resolve {
   background: none; border: none; color: var(--lm-muted);
   font-size: 11px; cursor: pointer; padding: 0;

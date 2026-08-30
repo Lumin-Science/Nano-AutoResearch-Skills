@@ -69,7 +69,7 @@ var cur = 0, threads = [], latest = 0, ended = false, active = null, misses = 0,
 var answererReady = true;   /* false => nothing is auto-answering; an agent must poll */
 var draft = {};                 /* per-thread follow-up text, preserved across re-renders */
 var choices = {};               /* per-thread model/effort choice while drafting */
-var pending = null;             /* {slide,x,y,quote} while the composer is open */
+var pending = null;             /* {slide,x,y,quote,module} while composer is open */
 var models = [], defaultChoice = { model: null, effort: null };
 
 /* ---------- navigation ---------- */
@@ -248,10 +248,11 @@ function surfaceOf(section) {
 }
 
 /* ---------- composer ---------- */
-function openComposer(slide, x, y, quote, clientX, clientY) {
+function openComposer(slide, x, y, quote, module, clientX, clientY) {
   if (ended) return;
-  pending = { slide: slide, x: x, y: y, quote: quote || null };
-  $("lm-composer-where").textContent = "slide " + slide;
+  pending = { slide: slide, x: x, y: y, quote: quote || null, module: module || null };
+  $("lm-composer-where").textContent = "slide " + slide +
+    (module && module.label ? " · " + module.label.slice(0, 80) : "");
   var q = $("lm-composer-quote");
   if (quote) { q.textContent = "“" + quote.slice(0, 160) + "”"; q.hidden = false; }
   else { q.hidden = true; }
@@ -280,6 +281,7 @@ function sendComposer() {
   rememberChoice(choice);
   var body = { slide: pending.slide, x: pending.x, y: pending.y,
                quote: pending.quote, text: text,
+               module: pending.module,
                model: choice.model, effort: choice.effort };
   composerText.disabled = true;
   post("/api/threads", body, function (ok) {
@@ -309,8 +311,16 @@ slidesEl.addEventListener("click", function (e) {
   var y = (e.clientY - r.top) / r.height * 100;
   var sel = window.getSelection();
   var quote = sel && !sel.isCollapsed ? sel.toString().replace(/\s+/g, " ").trim() : "";
+  var moduleEl = e.target.closest(".lm-module[data-module]");
+  var module = moduleEl ? {
+    id: moduleEl.getAttribute("data-module") || "",
+    kind: moduleEl.getAttribute("data-kind") || "",
+    label: moduleEl.getAttribute("data-label") || "",
+    text: moduleEl.getAttribute("data-text") || ""
+  } : null;
   openComposer(parseInt(section.getAttribute("data-slide"), 10), x, y,
-               quote.length >= 4 ? quote.slice(0, 400) : null, e.clientX, e.clientY);
+               quote.length >= 4 ? quote.slice(0, 400) : null, module,
+               e.clientX, e.clientY);
 });
 
 /* ---------- rendering ---------- */
@@ -412,6 +422,10 @@ function renderCards() {
   });
   head.appendChild(res); card.appendChild(head);
 
+  if (t.module && t.module.label) {
+    var mod = document.createElement("div"); mod.className = "lm-card-module";
+    mod.textContent = t.module.label; card.appendChild(mod);
+  }
   if (t.quote) {
     var q = document.createElement("div"); q.className = "lm-card-quote";
     q.textContent = "“" + t.quote + "”"; card.appendChild(q);

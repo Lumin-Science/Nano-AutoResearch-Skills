@@ -28,6 +28,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -515,6 +516,385 @@ def rasterize(pdf, out_dir, dpi=None):
     return [os.path.relpath(p, out_dir) for p in pngs]
 
 
+def _median(values, default=0.0):
+    values = sorted(float(v) for v in values if float(v) > 0)
+    if not values:
+        return float(default)
+    mid = len(values) // 2
+    if len(values) % 2:
+        return values[mid]
+    return (values[mid - 1] + values[mid]) / 2.0
+
+
+def _local_tag(node):
+    return str(node.tag).rsplit("}", 1)[-1]
+
+
+def _box_from_xml(node):
+    try:
+        x1 = float(node.attrib["xMin"])
+        y1 = float(node.attrib["yMin"])
+        x2 = float(node.attrib["xMax"])
+        y2 = float(node.attrib["yMax"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if x2 <= x1 or y2 <= y1:
+        return None
+    return {"x": x1, "y": y1, "w": x2 - x1, "h": y2 - y1}
+
+
+def parse_pdf_bbox_layout(blob):
+    """Parse Poppler's XHTML bbox output into page/block/line/word geometry.
+
+    Kept separate from the subprocess wrapper so segmentation can be exercised
+    with small deterministic fixtures and no PDF-generation dependency.
+    """
+    try:
+        root = ET.fromstring(blob)
+    except (ET.ParseError, TypeError, ValueError):
+        return []
+    pages = []
+    for page_node in (node for node in root.iter() if _local_tag(node) == "page"):
+        try:
+            page_w = float(page_node.attrib["width"])
+            page_h = float(page_node.attrib["height"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        blocks = []
+        for block_node in (node for node in page_node.iter()
+                           if _local_tag(node) == "block"):
+            box = _box_from_xml(block_node)
+            if not box:
+                continue
+            lines, words = [], []
+            for line_node in (node for node in block_node
+                              if _local_tag(node) == "line"):
+                line_box = _box_from_xml(line_node)
+                line_words = []
+                for word_node in (node for node in line_node
+                                  if _local_tag(node) == "word"):
+                    word_box = _box_from_xml(word_node)
+                    word_text = "".join(word_node.itertext()).strip()
+                    if not word_box or not word_text:
+                        continue
+                    word_box["text"] = word_text
+                    line_words.append(word_box)
+                    words.append(word_box)
+                if line_box and line_words:
+                    line_box["words"] = line_words
+                    line_box["text"] = " ".join(word["text"] for word in line_words)
+                    lines.append(line_box)
+            if not words:
+                continue
+            box.update({"lines": lines, "words": words,
+                        "text": "\n".join(line["text"] for line in lines),
+                        "kind_hint": None})
+            blocks.append(box)
+        pages.append({"width": page_w, "height": page_h, "blocks": blocks})
+    return pages
+
+
+def extract_pdf_bbox_layout(pdf, npages):
+    if not shutil.which("pdftotext"):
+        return [None] * npages
+    r = subprocess.run(["pdftotext", "-bbox-layout", pdf, "-"],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        emit("warn", "PDF block extraction failed — using a page-wide text layer",
+             "upgrade poppler or check the PDF text layer")
+        return [None] * npages
+    parsed = parse_pdf_bbox_layout(r.stdout)
+    if not parsed:
+        emit("warn", "PDF has no positioned text blocks",
+             "image-only pages remain clickable but need OCR for text blocks")
+        return [None] * npages
+    return (parsed + [None] * npages)[:npages]
+
+
+def extract_pdf_image_boxes(pdf, pages):
+    """Return embedded raster-image boxes in the coordinate space of bbox pages.
+
+    Vector plots have no image object in a PDF and are therefore covered by the
+    page surface (and often by their positioned labels/caption), but ordinary
+    embedded figures receive a first-class clickable region here.
+    """
+    result = [[] for _ in pages]
+    tool = shutil.which("pdftohtml")
+    if not tool or not pages:
+        return result
+    try:
+        with tempfile.TemporaryDirectory(prefix="ar-meeting-pdf-layout-") as tmp:
+            stem = os.path.join(tmp, "layout")
+            r = subprocess.run([tool, "-xml", "-hidden", "-nodrm", "-q", pdf, stem],
+                               capture_output=True, text=True, timeout=120)
+            xml_path = stem + ".xml"
+            if r.returncode != 0 or not os.path.isfile(xml_path):
+                return result
+            root = ET.parse(xml_path).getroot()
+            html_pages = [node for node in root.iter() if _local_tag(node) == "page"]
+            for idx, node in enumerate(html_pages[:len(pages)]):
+                page = pages[idx]
+                if not page:
+                    continue
+                try:
+                    src_w = float(node.attrib["width"])
+                    src_h = float(node.attrib["height"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if src_w <= 0 or src_h <= 0:
+                    continue
+                for image_node in (child for child in node
+                                   if _local_tag(child) == "image"):
+                    try:
+                        box = {
+                            "x": float(image_node.attrib["left"]) / src_w * page["width"],
+                            "y": float(image_node.attrib["top"]) / src_h * page["height"],
+                            "w": float(image_node.attrib["width"]) / src_w * page["width"],
+                            "h": float(image_node.attrib["height"]) / src_h * page["height"],
+                        }
+                    except (KeyError, TypeError, ValueError):
+                        continue
+                    if box["w"] <= 0 or box["h"] <= 0:
+                        continue
+                    box.update({"lines": [], "words": [], "text": "",
+                                "kind_hint": "figure"})
+                    result[idx].append(box)
+    except (OSError, ET.ParseError, subprocess.SubprocessError):
+        return result
+    return result
+
+
+def _edge_gap(a1, a2, b1, b2):
+    if a2 < b1:
+        return b1 - a2
+    if b2 < a1:
+        return a1 - b2
+    return 0.0
+
+
+def _overlap(a1, a2, b1, b2):
+    return max(0.0, min(a2, b2) - max(a1, b1))
+
+
+def _equationish(text):
+    text = " ".join((text or "").split())
+    if not text or len(text) > 500:
+        return False
+    strong = bool(re.search(r"[=∑∏∫√≤≥≈≠±×÷∞∂∇λθβ⊤]", text))
+    symbolic = len(re.findall(r"[^\w\s.,;:'\"!?()-]", text, flags=re.UNICODE))
+    words = len(text.split())
+    return strong and (words <= 45 or symbolic >= max(2, words // 3))
+
+
+def _equation_number(text):
+    return bool(re.match(r"^\(\s*\d+[A-Za-z]?\s*\)$", (text or "").strip()))
+
+
+def _should_merge_pdf_blocks(a, b, page_w, median_h):
+    if a.get("kind_hint") or b.get("kind_hint"):
+        return False
+    ax2, ay2 = a["x"] + a["w"], a["y"] + a["h"]
+    bx2, by2 = b["x"] + b["w"], b["y"] + b["h"]
+    xgap = _edge_gap(a["x"], ax2, b["x"], bx2)
+    ygap = _edge_gap(a["y"], ay2, b["y"], by2)
+    xov = _overlap(a["x"], ax2, b["x"], bx2)
+    yov = _overlap(a["y"], ay2, b["y"], by2)
+
+    same_band = yov >= min(a["h"], b["h"]) * 0.30
+    if same_band and xgap <= max(page_w * 0.035, median_h * 2.5):
+        return True
+
+    # Consecutive fragments in display math and columns/rows in compact tables.
+    aligned = (abs(a["x"] - b["x"]) <= median_h * 1.6 or
+               abs(ax2 - bx2) <= median_h * 1.6)
+    x_overlap_ratio = xov / max(1.0, min(a["w"], b["w"]))
+    if ygap <= median_h * 1.35 and (x_overlap_ratio >= 0.22 or aligned):
+        return True
+
+    # TeX equation numbers are often far to the right of the equation body.
+    if ((_equation_number(a.get("text")) and _equationish(b.get("text"))) or
+            (_equation_number(b.get("text")) and _equationish(a.get("text")))):
+        acy, bcy = a["y"] + a["h"] / 2.0, b["y"] + b["h"] / 2.0
+        if abs(acy - bcy) <= median_h * 1.5 and xgap <= page_w * 0.40:
+            return True
+    return False
+
+
+def _ordered_region_text(blocks):
+    lines = [line for block in blocks for line in block.get("lines", [])]
+    if not lines:
+        return ""
+    median_h = _median((line["h"] for line in lines), 10.0)
+    rows = []
+    for line in sorted(lines, key=lambda item: (item["y"] + item["h"] / 2.0,
+                                                item["x"])):
+        cy = line["y"] + line["h"] / 2.0
+        if rows and abs(cy - rows[-1][0]) <= median_h * 0.45:
+            rows[-1][1].append(line)
+            count = len(rows[-1][1])
+            rows[-1][0] = ((rows[-1][0] * (count - 1)) + cy) / count
+        else:
+            rows.append([cy, [line]])
+    out = []
+    for _, row in rows:
+        words = [word for line in sorted(row, key=lambda item: item["x"])
+                 for word in line.get("words", [])]
+        if words:
+            out.append(" ".join(word["text"] for word in words))
+    return "\n".join(out)
+
+
+def _cluster_count(values, tolerance):
+    values = sorted(float(value) for value in values)
+    if not values:
+        return 0
+    groups = 1
+    anchor = values[0]
+    for value in values[1:]:
+        if value - anchor > tolerance:
+            groups += 1
+            anchor = value
+    return groups
+
+
+def _tableish_region(region, median_h):
+    blocks = [block for block in region["blocks"] if block.get("words")]
+    lines = [line for block in blocks for line in block.get("lines", [])]
+    if len(blocks) < 3 or len(lines) < 3:
+        return False
+    columns = _cluster_count((block["x"] for block in blocks), median_h * 1.8)
+    rows = _cluster_count((line["y"] + line["h"] / 2.0 for line in lines),
+                          median_h * 0.75)
+    return columns >= 2 and rows >= 2
+
+
+def _classify_pdf_region(region, page_median_h):
+    text = " ".join(region.get("text", "").split())
+    hint = next((block.get("kind_hint") for block in region["blocks"]
+                 if block.get("kind_hint")), None)
+    if hint:
+        return hint
+    if re.match(r"^(?:fig(?:ure)?\.?)[\s ]*\d*\s*[:.]", text, re.I):
+        return "figure"
+    if re.match(r"^table[\s ]*\d*\s*[:.]", text, re.I):
+        return "table"
+    if _equationish(text):
+        return "equation"
+    if _tableish_region(region, page_median_h):
+        return "table"
+    word_count = len(text.split())
+    line_heights = [line["h"] for block in region["blocks"]
+                    for line in block.get("lines", [])]
+    region_font_h = _median(line_heights, page_median_h)
+    numbered_heading = bool(re.match(r"^\d+(?:\.\d+)*\s+\D", text))
+    if word_count <= 20 and (region_font_h >= page_median_h * 1.18 or numbered_heading):
+        return "heading"
+    return "text"
+
+
+def pdf_layout_regions(page, image_boxes=None):
+    """Group low-level PDF text boxes into useful clickable page modules."""
+    if not page:
+        return []
+    blocks = list(page.get("blocks") or []) + list(image_boxes or [])
+    text_line_heights = [line["h"] for block in blocks
+                         for line in block.get("lines", [])]
+    median_h = _median(text_line_heights, max(8.0, page["height"] / 90.0))
+    parent = list(range(len(blocks)))
+
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    def union(i, j):
+        a, b = find(i), find(j)
+        if a != b:
+            parent[b] = a
+
+    for i, first in enumerate(blocks):
+        for j in range(i + 1, len(blocks)):
+            if _should_merge_pdf_blocks(first, blocks[j], page["width"], median_h):
+                union(i, j)
+
+    grouped = {}
+    for idx, block in enumerate(blocks):
+        grouped.setdefault(find(idx), []).append(block)
+    regions = []
+    for members in grouped.values():
+        x1 = min(block["x"] for block in members)
+        y1 = min(block["y"] for block in members)
+        x2 = max(block["x"] + block["w"] for block in members)
+        y2 = max(block["y"] + block["h"] for block in members)
+        region = {"x": x1, "y": y1, "w": x2 - x1, "h": y2 - y1,
+                  "blocks": members, "words": [word for block in members
+                                                  for word in block.get("words", [])]}
+        region["text"] = _ordered_region_text(members)
+        region["kind"] = _classify_pdf_region(region, median_h)
+        regions.append(region)
+    return sorted(regions, key=lambda item: (item["y"], item["x"]))
+
+
+def _pdf_region_style(region, page_w, page_h):
+    pad_x, pad_y = page_w * 0.002, page_h * 0.0015
+    x = max(0.0, region["x"] - pad_x)
+    y = max(0.0, region["y"] - pad_y)
+    x2 = min(page_w, region["x"] + region["w"] + pad_x)
+    y2 = min(page_h, region["y"] + region["h"] + pad_y)
+    return ("left:%.3f%%;top:%.3f%%;width:%.3f%%;height:%.3f%%" %
+            (x / page_w * 100.0, y / page_h * 100.0,
+             (x2 - x) / page_w * 100.0, (y2 - y) / page_h * 100.0)), (x, y, x2, y2)
+
+
+def _pdf_region_words(region, padded_box, page_w):
+    x1, y1, x2, y2 = padded_box
+    width, height = max(1.0, x2 - x1), max(1.0, y2 - y1)
+    spans = []
+    for word in sorted(region.get("words", []), key=lambda item: (item["y"], item["x"])):
+        style = ("left:%.3f%%;top:%.3f%%;width:%.3f%%;height:%.3f%%;font-size:%.3fcqw" %
+                 ((word["x"] - x1) / width * 100.0,
+                  (word["y"] - y1) / height * 100.0,
+                  word["w"] / width * 100.0, word["h"] / height * 100.0,
+                  word["h"] / page_w * 100.0))
+        spans.append('<span class="lm-pdf-word" style="%s">%s</span>' %
+                     (style, esc(word["text"])))
+    if not spans:
+        return ""
+    return '<span class="lm-pdf-block-text">%s</span>' % "".join(spans)
+
+
+def pdf_region_overlays(page_no, page, image_boxes=None):
+    regions = pdf_layout_regions(page, image_boxes)
+    if not regions:
+        return "", []
+    mc = ModuleCounter(page_no)
+    prefix = {"heading": "h", "equation": "e", "table": "l",
+              "figure": "f", "text": "t"}
+    parts, manifest = [], []
+    for region in regions:
+        kind = region["kind"]
+        module_id = mc.next(prefix.get(kind, "t"))
+        module_text = " ".join(region.get("text", "").split())[:500]
+        snippet = module_text[:96]
+        label = "%s: %s" % (kind, snippet) if snippet else kind
+        style, padded_box = _pdf_region_style(region, page["width"], page["height"])
+        inner = _pdf_region_words(region, padded_box, page["width"])
+        parts.append('<div class="lm-overlay lm-module lm-pdf-block lm-pdf-%s" '
+                     'data-module="%s" data-kind="%s" data-label="%s" '
+                     'data-text="%s" aria-label="%s" title="%s" tabindex="0" '
+                     'style="%s">%s</div>' %
+                     (kind, module_id, kind, attr(label), attr(module_text),
+                      attr(label), attr(label), style, inner))
+        manifest.append({"id": module_id, "kind": kind, "label": label,
+                         "text": region.get("text", ""),
+                         "x": region["x"] / page["width"] * 100.0,
+                         "y": region["y"] / page["height"] * 100.0,
+                         "w": region["w"] / page["width"] * 100.0,
+                         "h": region["h"] / page["height"] * 100.0})
+    return "".join(parts), manifest
+
+
 def extract_pdf_text(pdf, npages):
     if not shutil.which("pdftotext"):
         emit("warn", "pdftotext not found — selectable text layer skipped",
@@ -528,17 +908,23 @@ def extract_pdf_text(pdf, npages):
     return texts
 
 
-def build_page_slide(idx, png_rel, text="", overlays="", notes=None, topic=None):
+def build_page_slide(idx, png_rel, text="", overlays="", notes=None, topic=None,
+                     coarse_text=True, page_module=True, modules=None):
     mc = ModuleCounter(idx)
-    pid = mc.next("p")
     if not topic:
         first = next((l.strip() for l in (text or "").splitlines() if l.strip()), "")
         topic = first[:48] if first else "Page %d" % idx
-    parts = ['<div class="lm-page lm-module" data-module="%s" data-kind="image-region" '
-             'data-label="page %d" tabindex="0">' % (pid, idx)]
+    if page_module:
+        pid = mc.next("p")
+        opening = ('<div class="lm-page lm-module" data-module="%s" '
+                   'data-kind="image-region" data-label="page %d" tabindex="0">' %
+                   (pid, idx))
+    else:
+        opening = '<div class="lm-page">'
+    parts = [opening]
     parts.append('<img class="lm-page-img" src="%s" alt="page %d" draggable="false">'
                  % (attr(png_rel), idx))
-    if text.strip():
+    if coarse_text and text.strip():
         parts.append('<div class="lm-textlayer">%s</div>' % esc(text))
     if overlays:
         parts.append(overlays)
@@ -549,14 +935,25 @@ def build_page_slide(idx, png_rel, text="", overlays="", notes=None, topic=None)
                      'data-label="speaker notes"><summary>Speaker notes</summary>'
                      '<div class="lm-notes-body">%s</div></details>' % (nid, esc(notes)))
     return {"n": idx, "topic": topic, "body": "\n".join(parts),
-            "text": ((text or "") + ("\n\nSpeaker notes: " + notes if notes else "")).strip()}
+            "text": ((text or "") + ("\n\nSpeaker notes: " + notes if notes else "")).strip(),
+            "modules": list(modules or [])}
 
 
 def convert_pdf(path, out_dir, mode=None):
     pdf = os.path.abspath(path)
     pngs = rasterize(pdf, out_dir)
     texts = extract_pdf_text(pdf, len(pngs))
-    return [build_page_slide(i, p, texts[i - 1]) for i, p in enumerate(pngs, 1)]
+    layouts = extract_pdf_bbox_layout(pdf, len(pngs))
+    image_boxes = extract_pdf_image_boxes(pdf, layouts)
+    slides = []
+    for i, png in enumerate(pngs, 1):
+        page = layouts[i - 1]
+        overlays, modules = pdf_region_overlays(
+            i, page, image_boxes[i - 1]) if page else ("", [])
+        slides.append(build_page_slide(i, png, texts[i - 1], overlays,
+                                       coarse_text=not bool(overlays),
+                                       page_module=not bool(overlays), modules=modules))
+    return slides
 
 
 def find_soffice():
@@ -784,7 +1181,10 @@ def write_slide_context(out_dir, slides):
             body = re.sub(r"<[^>]+>", " ", body)
             text = html.unescape(re.sub(r"[ \t]+", " ", body)).strip()
             text = re.sub(r"\n\s*\n\s*\n+", "\n\n", text)
-        ctx.append({"n": s["n"], "topic": s["topic"], "text": text[:8000]})
+        row = {"n": s["n"], "topic": s["topic"], "text": text[:8000]}
+        if s.get("modules"):
+            row["modules"] = s["modules"]
+        ctx.append(row)
     with open(os.path.join(out_dir, "slides.json"), "w", encoding="utf-8") as f:
         json.dump(ctx, f, ensure_ascii=False, indent=1)
 

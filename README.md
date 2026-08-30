@@ -6,7 +6,7 @@ Three standalone [Agent Skills](https://agentskills.io/) for selectively adding 
 
 - `ar-kickstart` turns a rough scientific question into grounded scientific and evaluation contracts, then prepares a research formulation and visual-report packet.
 - `ar-loop-n-sleep` advances long-running research in tmux and wakes the same pane at the next useful checkpoint instead of polling with model turns.
-- `ar-meeting` opens PPTX, PDF, Markdown, or HTML presentations as a local click-to-ask review room with persistent feedback.
+- `ar-meeting` opens PPTX, block-aware PDF, Markdown, or HTML presentations as a local click-to-ask review room with persistent feedback.
 
 ## Install
 

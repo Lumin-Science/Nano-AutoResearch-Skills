@@ -110,6 +110,14 @@ d=open('meeting/t2r/slides/page-1.png','rb').read(33)
 print('yes' if struct.unpack('>I', d[16:20])[0] > 1400 else 'no')")" "yes"
     chk "page text kept for the answerer" "$(python3 -c "
 import json;print('Rendered Slide One' in json.load(open('meeting/t2r/slides.json'))[0]['text'])")" "True"
+    if command -v pdftotext >/dev/null 2>&1; then
+      chk "pdf text split into positioned blocks" \
+        "$(grep -c 'class=\"lm-overlay lm-module lm-pdf-block' meeting/t2r/index.html | awk '{print ($1 > 0 ? "yes" : "no")}')" "yes"
+      chk "pdf block manifest kept for comments" "$(python3 -c "
+import json;print(bool(json.load(open('meeting/t2r/slides.json'))[0].get('modules')))")" "True"
+    else
+      skip "pdftotext absent - positioned PDF blocks not exercised"
+    fi
   else
     skip "LibreOffice could not build the sample pdf"
   fi
@@ -121,7 +129,7 @@ echo "[T3] comment threads"
 $LM open meeting/t1 --no-open >/dev/null 2>&1
 PORT=$(python3 -c "import json;print(json.load(open('meeting/t1/.state/server.json'))['port'])")
 TID=$(curl -s -X POST "http://127.0.0.1:$PORT/api/threads" -H 'Content-Type: application/json' \
-  -d '{"slide":2,"x":40,"y":55,"text":"why does recycling matter?"}' \
+  -d '{"slide":2,"x":40,"y":55,"module":{"id":"s2.t1","kind":"text","label":"text: Recycling matters","text":"Recycling matters."},"text":"why does recycling matter?"}' \
   | python3 -c "import json,sys;print(json.load(sys.stdin)['thread'])")
 chk "thread created" "$TID" "t1"
 for i in $(seq 1 20); do
@@ -135,7 +143,7 @@ chk "auto-answered" "$ST" "done"
 chk "answer stored" "$(curl -s "http://127.0.0.1:$PORT/api/threads" | python3 -c "
 import json,sys;print('stub answer' in json.load(sys.stdin)['threads'][0]['messages'][1]['text'])")" "True"
 chk "anchor preserved" "$(curl -s "http://127.0.0.1:$PORT/api/threads" | python3 -c "
-import json,sys;t=json.load(sys.stdin)['threads'][0];print(int(t['x']),int(t['y']),t['slide'])")" "40 55 2"
+import json,sys;t=json.load(sys.stdin)['threads'][0];print(int(t['x']),int(t['y']),t['slide'],t['module']['id'])")" "40 55 2 s2.t1"
 curl -s -X POST "http://127.0.0.1:$PORT/api/threads/$TID/messages" -H 'Content-Type: application/json' \
   -d '{"text":"follow up question"}' >/dev/null
 for i in $(seq 1 20); do

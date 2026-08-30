@@ -44,7 +44,14 @@ class ForkAnswererTests(unittest.TestCase):
 
                 thread, _ = store.new_thread(1, 35, 45,
                     "What supports the 12 percent claim?",
+                    module={"id": "s1.e1", "kind": "equation",
+                            "label": "equation: accuracy = 0.82",
+                            "text": "accuracy = 0.82"},
                     model="gpt-test-sol", effort="high")
+                self.assertEqual(thread["module"]["id"], "s1.e1")
+                self.assertIn("Selected block text:",
+                              labmeet.build_prompt(str(meeting), thread, cfg,
+                                                   project_root=root))
                 answerer.kick(thread["id"])
                 self._wait_for_answer(store, thread["id"], 2)
                 first_state = store.agent_state()
@@ -83,6 +90,8 @@ class ForkAnswererTests(unittest.TestCase):
                 self.assertEqual(exported["threads"][0]["messages"][0]["model"],
                                  "gpt-test-sol")
                 self.assertIn("Anchor: `x=35.00%`, `y=45.00%`",
+                              Path(md_path).read_text(encoding="utf-8"))
+                self.assertIn("equation: accuracy = 0.82",
                               Path(md_path).read_text(encoding="utf-8"))
 
                 replayed = labmeet.Store(str(meeting))
