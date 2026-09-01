@@ -46,9 +46,9 @@ Before a normal exit:
    current step.
 3. Estimate the next useful check time and convert it to a delay in seconds.
 4. Start one background sleeper that wakes this exact tmux pane using a
-   dependency-free tmux bridge: capture the pane before acting, type the wake
-   message literally, capture again to verify it landed, then send `Enter`
-   after a short delay.
+   dependency-free tmux bridge: capture the pane before acting, leave tmux copy
+   mode if necessary, type the wake message literally, capture again to verify
+   it landed, then send `Enter` after a short delay.
 
 ```bash
 pane="${TMUX_PANE:?invoke ar-loop-n-sleep from inside tmux}"
@@ -69,8 +69,17 @@ sleep "$delay_seconds"
 tmux display-message -p -t "$pane" '#{pane_id}' >/dev/null
 tmux capture-pane -t "$pane" -p -J -S -20 >/dev/null
 
+if [[ "$(tmux display-message -p -t "$pane" '#{pane_in_mode}')" != "0" ]]; then
+  tmux send-keys -t "$pane" -X cancel
+  sleep 0.5
+fi
+if [[ "$(tmux display-message -p -t "$pane" '#{pane_in_mode}')" != "0" ]]; then
+  echo "ar-loop-n-sleep: pane $pane remained in tmux mode; not sending wake text" >&2
+  exit 1
+fi
+
 tmux send-keys -t "$pane" -l -- "$message"
-sleep 0.2
+sleep 0.5
 
 if ! tmux capture-pane -t "$pane" -p -J -S -20 | grep -F -- "$message" >/dev/null; then
   echo "ar-loop-n-sleep: wake text was not visible in pane $pane; not pressing Enter" >&2
@@ -81,11 +90,12 @@ tmux send-keys -t "$pane" Enter
 SH
 
 chmod +x "$wake_script"
-tmux run-shell -b "'$wake_script' '${delay_seconds}' '$pane'; rm -f '$wake_script'"
+tmux run-shell -b "'$wake_script' '${delay_seconds}' '$pane' && rm -f '$wake_script'"
 ```
 
 This intentionally follows the tmux-bridge pattern from smux without depending
-on `tmux-bridge`: read the target pane, type literal text, read back to verify,
-then send keys. Do not use `codex queue` in this skill. Do not spend model turns
-polling a healthy run. Do not claim success, fabricate healthy training, or
-schedule an unsafe continuation when work is genuinely blocked.
+on `tmux-bridge`: read the target pane, cancel copy mode, type literal text,
+read back to verify, then send keys. A failed wake leaves its temporary script
+in place for diagnosis. Do not use `codex queue` in this skill. Do not spend
+model turns polling a healthy run. Do not claim success, fabricate healthy
+training, or schedule an unsafe continuation when work is genuinely blocked.
